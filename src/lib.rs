@@ -1316,236 +1316,6 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     }
 }
 
-/// Loop thread AUDIO: demux+decode audio dari file handle-nya SENDIRI,
-/// resample ke format device, dorong ke ring buffer. Sama sekali gak
-/// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
-/// seek-nya independen total dari video, jadi video yang lagi berat gak
-/// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
-///
-/// Helper: resample SATU frame audio hasil decode -> push ke ring buffer.
-/// Dipisah dari loop utama (BUKAN cuma dipanggil sekali) karena dipanggil
-/// dari DUA tempat: (1) jalur normal abis receive_frame() dalem loop paket,
-/// (2) jalur drain abis send_eof() -- FFmpeg codec kayak AAC/Opus sering
-/// nahan beberapa frame di buffer internal (decode delay/reorder), dan itu
-/// CUMA keluar via receive_frame() lagi SETELAH send_eof() dipanggil.
-/// Sebelumnya jalur (2) ini gak ada sama sekali -> sample-sample terakhir
-/// yang masih ke-buffer di decoder ilang gitu aja, bikin audio berhenti
-/// sebelum video abis walau track audio-nya sebenernya sama panjang.
-fn push_resampled_audio_frame(
-    aframe: &mut ffmpeg_next::frame::Audio,
-    resampler: &mut Option<ffmpeg_next::software::resampling::Context>,
-    producer: &mut AudioProducer,
-    shared: &Shared,
-    decoder_channels: i32,
-    out_layout: ffmpeg_next::util::channel_layout::ChannelLayout,
-    out_rate: u32,
-    out_channels: u16,
-    expected_audio_pts: &mut f64,
-    atb: f64,
-) {
-    // Ambil PTS frame aktual, atau gunakan expected jika tidak ada
-    let frame_pts = aframe.timestamp().map(|ts| ts as f64 * atb).unwrap_or(*expected_audio_pts);
-
-    // 1. PAD SILENCE JIKA ADA GAP (Start Delay / Audio Bolong)
-    // Toleransi 0.1 detik untuk mencegah pergeseran sync.
-    if frame_pts > *expected_audio_pts + 0.1 {
-        let raw_gap_sec = frame_pts - *expected_audio_pts;
-
-        // [FIX] BATASI gap yang di-pad. Gap gede (misal belasan detik)
-        // hampir pasti BUKAN silence asli di track, tapi anomali PTS
-        // (glitch timestamp/reorder codec di titik tertentu file).
-        // Kalau dibiarin tanpa batas, loop backpressure di bawah bakal
-        // ngabisin waktu WALL-CLOCK nyata cuma buat nyorong silence
-        // sebanyak itu ke ring buffer -- sementara video jalan terus
-        // independen dan bisa nyampe EOF duluan (nge-trigger shared.stop)
-        // SEBELUM decode thread ini sempet balik ngedecode sisa audio
-        // ASLI setelah titik gap tsb. Efeknya: sisa audio asli abis
-        // titik gap ini ilang total, kedengeran kayak "audio berhenti
-        // duluan" walau file aslinya audio-nya lebih panjang.
-        // Dicap ke MAX_GAP_PAD_SEC detik: gap wajar (start delay dsb)
-        // tetep di-pad buat sync, gap ekstrem cuma di-log & di-resync
-        // tanpa nelen waktu real audio berikutnya.
-        // [FIX] Sebelumnya 2.0 detik -- itu titik pembuangan konten ASLI
-        // (bukan cuma silence): expected_audio_pts tetep di-snap penuh ke
-        // frame_pts real di bawah, padahal cuma sebagian gap yg didorong
-        // ke ring buffer -> sisanya ilang permanen dari waktu putar
-        // (persis penyebab audio berhenti jauh sebelum durasi aslinya).
-        // Cap kecil itu dulu perlu karena is_eof() cuma nunggu video --
-        // sekarang udah nunggu audio_eof juga (lihat is_eof()), jadi gak
-        // ada lagi risiko caller manggil close() di tengah proses bridging
-        // gap besar. Angka di bawah ini murni pengaman anti-hang buat gap
-        // yang gak masuk akal (file korup total), bukan titik pembuangan.
-        const MAX_GAP_PAD_SEC: f64 = 30.0;
-        if raw_gap_sec > MAX_GAP_PAD_SEC {
-            eprintln!(
-                "[media_engine] PTS jump gede ({:.2}s) kedetect @ ~{:.2}s -- dianggap glitch timestamp (bukan silence asli), pad dibatasin ke {:.1}s biar sisa audio asli abis titik ini tetep sempet ke-decode",
-                raw_gap_sec, shared.position(), MAX_GAP_PAD_SEC,
-            );
-        }
-        let gap_sec = raw_gap_sec.min(MAX_GAP_PAD_SEC);
-        let gap_samples = (gap_sec * out_rate as f64) as usize * out_channels as usize;
-        let silence = vec![0.0f32; 2048.min(gap_samples)];
-        let mut pushed_total = 0;
-        let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
-
-        while pushed_total < gap_samples {
-            if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
-                break;
-            }
-            if producer.occupied_len() >= a_cap {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            let to_push = (gap_samples - pushed_total).min(silence.len());
-            let pushed = producer.push_slice(&silence[..to_push]);
-            pushed_total += pushed;
-            shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
-        }
-    }
-
-    // 2. SETUP RESAMPLER (+ patch metadata channel_layout kalau kosong)
-    // [FIX] MP3 (apalagi dengan ID3v2 tag gede / Xing-VBR header di
-    // frame pertama) kadang bikin decoder.channels() masih 0 sesaat
-    // sebelum frame audio pertama beneran ke-parse. ChannelLayout
-    // kosong (0 channel) diteruskan ke Context::get() beresiko kena
-    // assert/unwrap internal di binding ffmpeg (panic BUKAN dari kode
-    // kita, tapi dari crate) -- fallback ke stereo daripada terusin
-    // dengan channel count 0.
-    let safe_channels = if decoder_channels > 0 { decoder_channels } else { 2 };
-    let src_layout = if aframe.channel_layout().bits() != 0 {
-        aframe.channel_layout()
-    } else {
-        ffmpeg_next::util::channel_layout::ChannelLayout::default(safe_channels)
-    };
-
-    // [FIX BARU] Banyak decoder PCM mentah (kasus umum WAV, termasuk file
-    // SFX pendek kayak shoot/burst/clear/combo) TIDAK ngisi
-    // frame->channel_layout sama sekali (dibiarin 0) walau channel COUNT-nya
-    // valid. Context::run() -> swr_convert_frame() MEMVALIDASI channel_layout
-    // MENTAH bawaan si frame itu sendiri terhadap konfigurasi context -- kalau
-    // beda (0 vs default stereo yang kita pakai buat Context::get() di
-    // bawah), FFmpeg langsung nolak convert dengan AVERROR_INPUT_CHANGED
-    // ("Input changed") dan frame-nya didrop tanpa retry. Buat file pendek
-    // yang cuma punya 1-2 frame audio doang, ini artinya SELURUH suaranya
-    // hilang total (langsung EOF). Fix: patch metadata di frame-nya SENDIRI
-    // (bukan cuma variabel src_layout lokal), di SETIAP frame yang layout
-    // mentahnya kosong -- bukan cuma sekali pas resampler masih None, karena
-    // untuk decoder PCM biasanya SEMUA frame dari file yang sama kena kondisi
-    // yang sama (bukan cuma frame pertama).
-    if aframe.channel_layout().bits() == 0 {
-        aframe.set_channel_layout(src_layout);
-    }
-
-    if resampler.is_none() {
-        *resampler = match ffmpeg_next::software::resampling::Context::get(
-            aframe.format(), src_layout, aframe.rate(),
-            ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
-            out_layout, out_rate,
-        ) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("[media_engine] gagal bikin audio resampler: {e}");
-                None
-            }
-        };
-    }
-
-    // 3. RESAMPLE & PUSH FRAME AKTUAL (Anti-Drop Backpressure)
-    //
-    // [FIX BARU] Dipisah jadi closure `do_resample_and_push` supaya bisa
-    // dipanggil DUA KALI: sekali pakai resampler yang ada, dan kalau itu
-    // masih gagal (kasus format BENERAN berubah di tengah stream, bukan
-    // cuma metadata channel_layout kosong yang udah dipatch di bagian 2),
-    // rebuild resampler pakai parameter frame SEKARANG lalu retry sekali
-    // sebelum bener-bener nyerah & drop frame ini.
-    let mut do_resample_and_push = |rs: &mut ffmpeg_next::software::resampling::Context,
-                                 aframe: &ffmpeg_next::frame::Audio|
-     -> Result<(), ffmpeg_next::Error> {
-        let mut resampled = ffmpeg_next::frame::Audio::empty();
-        rs.run(aframe, &mut resampled)?;
-
-        let n_samples = resampled.samples() * out_channels as usize;
-        let raw = resampled.data(0);
-        if raw.len() >= n_samples * 4 {
-            let floats: &[f32] = unsafe {
-                std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
-            };
-
-            // [BARU] Downmix ke mono & simpen ke viz_ring buat FFT
-            // visualizer. Ini SELALU jalan (gak peduli backpressure
-            // ring buffer playback di bawah) karena tujuannya cuma
-            // nampilin "apa yang lagi didecode sekarang", bukan
-            // ikut aturan sinkronisasi audio-video.
-            {
-                let ch = out_channels as usize;
-                let mut viz = shared.viz_ring.lock().unwrap();
-                for frame in floats.chunks(ch) {
-                    let mono = frame.iter().sum::<f32>() / ch as f32;
-                    viz.push_back(mono);
-                }
-                while viz.len() > VIZ_RING_CAP {
-                    viz.pop_front();
-                }
-            }
-
-            let mut pushed_total = 0;
-            let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
-
-            // Loop ini menjamin tidak ada 1 sampel pun yang dibuang saat ring buffer penuh
-            while pushed_total < n_samples {
-                if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
-                    break;
-                }
-                if producer.occupied_len() >= a_cap {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                let chunk = &floats[pushed_total..];
-                let pushed = producer.push_slice(chunk);
-                pushed_total += pushed;
-                shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
-            }
-        }
-        Ok(())
-    };
-
-    if let Some(rs) = resampler.as_mut() {
-        if let Err(e) = do_resample_and_push(rs, aframe) {
-            eprintln!(
-                "[media_engine] resample audio gagal @ ~{:.2}s: {e} -- rebuild resampler & retry sekali",
-                shared.position(),
-            );
-            // Rebuild pakai parameter frame SEKARANG (bukan pas Context
-            // pertama dibikin) -- kalau file emang beneran ganti format di
-            // tengah jalan, ini yang bakal nyelametin sisa audionya.
-            match ffmpeg_next::software::resampling::Context::get(
-                aframe.format(), src_layout, aframe.rate(),
-                ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
-                out_layout, out_rate,
-            ) {
-                Ok(mut new_rs) => {
-                    if let Err(e2) = do_resample_and_push(&mut new_rs, aframe) {
-                        eprintln!(
-                            "[media_engine] retry resample tetep gagal @ ~{:.2}s: {e2} -- frame ini di-skip",
-                            shared.position(),
-                        );
-                    }
-                    *resampler = Some(new_rs);
-                }
-                Err(e2) => {
-                    eprintln!(
-                        "[media_engine] gagal rebuild resampler @ ~{:.2}s: {e2} -- frame ini di-skip",
-                        shared.position(),
-                    );
-                }
-            }
-        }
-    }
-
-    // 4. UPDATE EXPECTED PTS UNTUK ITERASI BERIKUTNYA
-    let duration_sec = aframe.samples() as f64 / aframe.rate() as f64;
-    *expected_audio_pts = frame_pts + duration_sec;
-}
 
 /// Helper untuk mendorong slice float hasil resample ke viz_ring & producer ringbuffer,
 /// sekaligus mengembalikan jumlah sample frame (per-channel) yang benar-benar tertulis.
@@ -1707,7 +1477,7 @@ fn push_resampled_audio_frame(
         // Jika SwrContext menahan sisa sampel yang cukup banyak (misal karena buffer output
         // bawaan `Audio::empty()` kekecilan saat upsampling 44.1k -> 48k), tarik sisanya:
         if let Some(delay) = delay_opt {
-            if delay > 0 {
+            if delay.output > 0 {
                 let mut flushed = ffmpeg_next::frame::Audio::empty();
                 while let Ok(rem) = rs.flush(&mut flushed) {
                     let f_samples = flushed.samples() * ch;
@@ -1719,7 +1489,7 @@ fn push_resampled_audio_frame(
                         std::slice::from_raw_parts(f_raw.as_ptr() as *const f32, f_samples)
                     };
                     total_frames_pushed += push_floats_to_ring(floats, producer, shared, out_rate, out_channels);
-                    if rem.is_none() || rem == Some(0) {
+                    if rem.map_or(true, |d| d.output == 0) {
                         break;
                     }
                 }
@@ -1759,6 +1529,11 @@ fn push_resampled_audio_frame(
     }
 }
 
+/// Loop thread AUDIO: demux+decode audio dari file handle-nya SENDIRI,
+/// resample ke format device, dorong ke ring buffer. Sama sekali gak
+/// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
+/// seek-nya independen total dari video, jadi video yang lagi berat gak
+/// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
 fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: AudioProducer) {
     let path = Path::new(&file_path);
     let mut input_ctx = match ffmpeg_next::format::input(&path) {
