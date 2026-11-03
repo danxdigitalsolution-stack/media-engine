@@ -343,6 +343,33 @@ jobs:
           ]
           EOF
 
+      # 🩹 [FIX] bindgen (ffmpeg-sys-next 9.0.1) ikut nge-parse <immintrin.h>
+      # bawaan clang 18, yang nge-include SEMUA header AMX (amxintrin.h,
+      # amxcomplexintrin.h, dst). Di target x86_64-pc-windows-gnu (layout
+      # ms_struct), struct `__tile1024i_str` di amxintrin.h dihasilkan bindgen
+      # dengan #[repr(packed)] + align(64) sekaligus -> rustc E0587/E0080.
+      # FFmpeg gak pakai AMX sama sekali, jadi semua header AMX di-skip
+      # lewat include guard-nya. Nama guard di-grep langsung dari header clang
+      # di runner (bukan ditulis manual) dan harus SEMUA header, karena
+      # men-skip amxintrin.h doang bikin amxcomplexintrin.h gagal dengan
+      # "unknown type name '_tile1024i'". Dikirim ke step berikutnya lewat
+      # GITHUB_ENV -- jadi JANGAN set BINDGEN_EXTRA_CLANG_ARGS_* lagi di
+      # `env:` step maturin (bakal menimpa hasil ini).
+      - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
+        run: |
+          inc=/usr/lib/llvm-18/lib/clang/18/include
+          if [ ! -d "$inc" ]; then
+            inc="$(dirname "$(find /usr/lib -path '*/clang/*/include/immintrin.h' | head -n1)")"
+          fi
+          defs="$(grep -h -m1 '^#ifndef __AMX' "$inc"/amx*.h | awk '{print "-D"$2}' | sort -u | tr '\n' ' ')"
+          if [ -z "$defs" ]; then
+            echo "::error::Guard AMX tidak ketemu di $inc"
+            exit 1
+          fi
+          echo "Header dir : $inc"
+          echo "Guard AMX  : $defs"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
+
       # ⚙️ FFmpeg udah dikompilasi manual di step sebelumnya dan diarahkan
       # lewat FFMPEG_DIR (env, sudah di-export ke $GITHUB_ENV). ffmpeg-sys-next
       # tinggal linking ke situ, gak nyoba compile ulang dari source lagi.
@@ -351,7 +378,6 @@ jobs:
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-          BINDGEN_EXTRA_CLANG_ARGS: "-mno-amx-tile"
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
       # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
