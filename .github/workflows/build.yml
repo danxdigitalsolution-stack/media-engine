@@ -350,14 +350,7 @@ jobs:
         timeout-minutes: 30
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"         
-          
-      - name: 🩹 Skip header AMX buat bindgen (struct AMX bikin E0587 di target mingw)
-        run: |
-          inc="$(llvm-config-18 --libdir)/clang/18/include"
-          defs="$(grep -h -m1 '^#ifndef __AMX' "$inc"/amx*.h | awk '{print "-D"$2}' | sort -u | tr '\n' ' ')"
-          echo "Guard AMX yang di-define: $defs"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
+          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
       # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
