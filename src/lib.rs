@@ -1453,49 +1453,46 @@ fn push_resampled_audio_frame(
         };
     }
 
-    // 3. RESAMPLE & KURAS DELAY INTERNAL SWRCONTEXT
-    // Penting: ketika resampling (mis. 44100 -> 48000), rs.run() mengembalikan Some(delay)
-    // jika masih ada sample yang mengendap di buffer internal SwrContext. Jika tidak di-flush
-    // secara bertahap atau dialokasikan cukup, ~8% sample akan hilang/terpotong!
+    // 3. RESAMPLE
+    // [FIX GLITCH] Versi sebelumnya manggil `rs.flush()` di TENGAH stream
+    // tiap kali `run()` ngembaliin Some(delay) -- padahal buat konversi
+    // sample-rate (mis. 44.1k -> 48k) delay itu SELALU > 0 (itu cuma sisa
+    // normal filter polyphase swresample, bukan sample "hilang"). flush()
+    // = tanda "stream udah abis": swresample nguras ekor filter + isi nol,
+    // jadi tiap frame (~20 ms) ada diskontinuitas = bunyi "krek"/glitch,
+    // plus jumlah sample yang didorong ikut ngaco (pts audio kebawa).
+    // Akar masalah aslinya (kenapa dulu dikira ada sample hilang ~8%):
+    // `Context::run()` ngalokasi frame output SEBESAR input.samples() kalau
+    // frame-nya kosong, padahal upsampling butuh output LEBIH banyak dari
+    // input -> sisanya nyangkut di buffer internal swresample. Solusinya:
+    // alokasi sendiri frame output yang cukup gede (sisa buffer internal +
+    // input yang di-scale ke out_rate + margin). Sisa delay yang tersisa
+    // otomatis keluar di panggilan run() berikutnya, nyambung mulus tanpa
+    // flush. (swr_convert_frame ngeset nb_samples ke jumlah aktual.)
     let mut do_resample_and_push = |rs: &mut ffmpeg_next::software::resampling::Context,
                                     aframe: &ffmpeg_next::frame::Audio|
      -> Result<usize, ffmpeg_next::Error> {
-        let mut total_frames_pushed = 0usize;
-        let mut resampled = ffmpeg_next::frame::Audio::empty();
-        let delay_opt = rs.run(aframe, &mut resampled)?;
+        let in_rate = (rs.input().rate as u64).max(1);
+        let o_rate = rs.output().rate as u64;
+        let buffered = rs.delay().map(|d| d.output.max(0) as u64).unwrap_or(0);
+        let needed = buffered + (aframe.samples() as u64 * o_rate + in_rate - 1) / in_rate + 64;
+        let mut resampled = ffmpeg_next::frame::Audio::new(
+            ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+            needed as usize,
+            out_layout,
+        );
+        rs.run(aframe, &mut resampled)?;
 
         let ch = out_channels.max(1) as usize;
         let n_samples = resampled.samples() * ch;
         let raw = resampled.data(0);
+        let mut total_frames_pushed = 0usize;
         if n_samples > 0 && raw.len() >= n_samples * 4 {
             let floats: &[f32] = unsafe {
                 std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
             };
             total_frames_pushed += push_floats_to_ring(floats, producer, shared, out_rate, out_channels);
         }
-
-        // Jika SwrContext menahan sisa sampel yang cukup banyak (misal karena buffer output
-        // bawaan `Audio::empty()` kekecilan saat upsampling 44.1k -> 48k), tarik sisanya:
-        if let Some(delay) = delay_opt {
-            if delay.output > 0 {
-                let mut flushed = ffmpeg_next::frame::Audio::empty();
-                while let Ok(rem) = rs.flush(&mut flushed) {
-                    let f_samples = flushed.samples() * ch;
-                    let f_raw = flushed.data(0);
-                    if f_samples == 0 || f_raw.len() < f_samples * 4 {
-                        break;
-                    }
-                    let floats: &[f32] = unsafe {
-                        std::slice::from_raw_parts(f_raw.as_ptr() as *const f32, f_samples)
-                    };
-                    total_frames_pushed += push_floats_to_ring(floats, producer, shared, out_rate, out_channels);
-                    if rem.map_or(true, |d| d.output == 0) {
-                        break;
-                    }
-                }
-            }
-        }
-
         Ok(total_frames_pushed)
     };
 
