@@ -351,6 +351,8 @@ jobs:
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
+          # bindgen: skip header AMX (struct __tile1024i_str bikin E0587 di target mingw)
+          BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: "-D__AMXINTRIN_H"
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
       # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
