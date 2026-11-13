@@ -464,6 +464,8 @@ struct Shared {
     // bisa independen ngecek "apa ada seek yang belom gue apply?" tanpa
     // rebutan konsumsi satu sinyal yang sama.
     seek_seq: AtomicU64,
+    video_acked_seq: AtomicU64,
+    audio_acked_seq: AtomicU64,
     seek_target: Mutex<f64>,
 
     playing: AtomicBool,
@@ -652,6 +654,8 @@ impl PlayerEngine {
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
             seek_seq: AtomicU64::new(0),
+            video_acked_seq: AtomicU64::new(0),
+            audio_acked_seq: AtomicU64::new(0),
             seek_target: Mutex::new(0.0),
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -706,9 +710,13 @@ impl PlayerEngine {
                         cpal::SampleFormat::F32 => Some(device.build_output_stream(
                             stream_cfg,
                             move |data: &mut [f32], _| {
-                                if shared_cb.audio_flush.swap(false, Ordering::Relaxed) {
+                                if shared_cb.audio_flush.swap(false, Ordering::SeqCst) {
                                     while consumer.try_pop().is_some() {}
-                                    shared_cb.audio_buffered_hint.store(0, Ordering::Relaxed);
+                                    shared_cb.audio_buffered_hint.store(0, Ordering::SeqCst);
+                                    for sample in data.iter_mut() {
+                                        *sample = 0.0;
+                                    }
+                                    return;
                                 }
                                 let ch = shared_cb.out_channels.load(Ordering::Relaxed).max(1) as usize;
                                 let vol = shared_cb.effective_volume();
@@ -821,7 +829,8 @@ impl PlayerEngine {
             // nyegah audio "kabur duluan" ninggalin video pas video masih
             // proses nyiapin frame pertama.
             let target = self.shared.position();
-            self.wait_for_seek_ready(target);
+            let seq = self.shared.seek_seq.load(Ordering::SeqCst);
+            self.wait_for_seek_ready(target, seq);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
@@ -899,6 +908,7 @@ impl PlayerEngine {
     /// duluan drpd video". Kalau lagi paused, gak ada yang perlu ditunggu
     /// (stream emang udah diem, dan Python nunggu next tick apa adanya).
     fn seek(&mut self, second: f64) {
+        let target = second.max(0.0);
         let was_playing = self.shared.playing.load(Ordering::Relaxed);
         if was_playing {
             if let Some(stream) = self._audio_stream.as_ref() {
@@ -907,15 +917,22 @@ impl PlayerEngine {
         }
 
         self.shared.eof.store(false, Ordering::SeqCst);
-        self.shared.audio_eof.store(false, Ordering::SeqCst); // [BARU]
-        *self.shared.seek_target.lock().unwrap() = second;
-        self.shared.seek_seq.fetch_add(1, Ordering::SeqCst);
+        self.shared.audio_eof.store(false, Ordering::SeqCst);
+        *self.shared.seek_target.lock().unwrap() = target;
+
+        // Bersihkan antrian video & reset clock terpusat di sini (1x saja)
+        // agar thread video & audio tidak saling menimpa clock/flush satu sama lain!
+        self.shared.video_q.lock().unwrap().clear();
+        self.shared.reset_clock(target);
+
+        let new_seq = self.shared.seek_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         if was_playing {
-            self.wait_for_seek_ready(second);
+            self.wait_for_seek_ready(target, new_seq);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
+            *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
         }
     }
 
@@ -1093,33 +1110,34 @@ impl PlayerEngine {
     /// buffer-nya siap, ninggalin video yang masih proses ngejar -- kerasa
     /// "audio duluan drpd video" tiap abis play()/seek(). Timeout ada biar
     /// UI gak nge-hang selamanya kalau video-nya lambat/macet.
-    fn wait_for_seek_ready(&self, target: f64) {
+    fn wait_for_seek_ready(&self, target: f64, expected_seq: u64) {
         let sr = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as usize;
         let ch = self.shared.out_channels.load(Ordering::Relaxed).max(1) as usize;
-        let audio_target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
-        let deadline = Instant::now() + Duration::from_millis(400);
+        let audio_target = (sr * ch) / 8; // ~125ms readahead baru pada posisi target
+        let deadline = Instant::now() + Duration::from_millis(450);
 
         while Instant::now() < deadline {
-            let audio_ready = !self.has_audio
-                || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
-            // [FIX] File audio murni (has_video = false) gak akan PERNAH
-            // ngisi video_q (video_decode_loop keluar cepat begitu gak
-            // nemu stream video) -- tanpa `!self.has_video ||` di sini,
-            // video_ready gak akan pernah true buat file kayak gitu, dan
-            // wait_for_seek_ready() bakal SELALU kena timeout 400ms penuh
-            // tiap kali play()/seek() dipanggil, walau audionya udah siap
-            // dari awal.
-            let video_ready = !self.has_video || {
-                let q = self.shared.video_q.lock().unwrap();
-                q.back().map(|f| f.pts + 0.05 >= target).unwrap_or(false)
-            };
-            if audio_ready && video_ready {
-                return;
+            let a_acked = !self.has_audio
+                || self.shared.audio_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+            let v_acked = !self.has_video
+                || self.shared.video_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+
+            if a_acked && v_acked {
+                let audio_ready = !self.has_audio
+                    || self.shared.audio_eof.load(Ordering::Relaxed)
+                    || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
+                let video_ready = !self.has_video
+                    || self.shared.eof.load(Ordering::Relaxed)
+                    || {
+                        let q = self.shared.video_q.lock().unwrap();
+                        q.front().map(|f| f.pts + 0.1 >= target).unwrap_or(false)
+                    };
+                if audio_ready && video_ready {
+                    return;
+                }
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(4));
         }
-        // Timeout -- lanjut aja apa adanya. Mending mulai agak nunda drpd
-        // UI (tombol Play/seekbar) kekunci nunggu tanpa batas.
     }
 }
 
@@ -1170,6 +1188,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     let mut vframe = ffmpeg_next::frame::Video::empty();
     let mut applied_seek_seq: u64 = 0;
     let mut sent_eof = false;
+    let mut video_skip_until: Option<f64> = None;
 
     // SATU iterator paket, dipakai berulang -- BUKAN dibikin baru tiap
     // baca satu paket (`input_ctx.packets().next()` tiap iterasi loop).
@@ -1204,15 +1223,15 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
             packet_iter = None; // lepas borrow dulu biar input_ctx bisa dipinjem buat seek()
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
-            if input_ctx.seek(ts, ..ts).is_ok() {
-                vdecoder.flush();
-                shared.video_q.lock().unwrap().clear();
-                shared.reset_clock(sec);
-                shared.eof.store(false, Ordering::Relaxed);
-                sent_eof = false;
-            }
+            let _ = input_ctx.seek(ts, ..ts);
+            vdecoder.flush();
+            shared.video_q.lock().unwrap().clear();
+            shared.eof.store(false, Ordering::Relaxed);
+            sent_eof = false;
+            video_skip_until = Some(sec);
             packet_iter = Some(input_ctx.packets()); // iterator baru, mulai dari posisi abis seek
             applied_seek_seq = current_seq;
+            shared.video_acked_seq.store(current_seq, Ordering::SeqCst);
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -1287,11 +1306,9 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                     );
                 }
                 if shared.loop_enabled.load(Ordering::Relaxed) {
-                    // Auto-restart: minta seek ke detik 0 lewat generation
-                    // counter yang sama kayak seek manual -- audio_decode_loop
-                    // bakal ikut nangkep & seek balik ke 0 juga di iterasi
-                    // dia berikutnya, independen, gak perlu ditunggu di sini.
                     *shared.seek_target.lock().unwrap() = 0.0;
+                    shared.video_q.lock().unwrap().clear();
+                    shared.reset_clock(0.0);
                     shared.seek_seq.fetch_add(1, Ordering::SeqCst);
                 } else {
                     shared.eof.store(true, Ordering::Relaxed);
@@ -1307,7 +1324,18 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
 
         if vdecoder.send_packet(&packet).is_ok() {
             while vdecoder.receive_frame(&mut vframe).is_ok() {
+                // Jika ada seek baru di tengah decode GOP panjang, langsung batalkan!
+                if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                    break;
+                }
                 let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
+                if let Some(target_sec) = video_skip_until {
+                    // Skip konversi RGB untuk frame keyframe lama sebelum titik seek
+                    if pts + 0.035 < target_sec {
+                        continue;
+                    }
+                    video_skip_until = None;
+                }
                 if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                     shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                 }
@@ -1347,9 +1375,17 @@ fn push_floats_to_ring(
     let mut pushed_total = 0;
     let a_cap = (out_rate as usize) * ch * 2;
 
+    let current_seq = shared.seek_seq.load(Ordering::SeqCst);
     while pushed_total < n_samples {
-        if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
+        if shared.stop.load(Ordering::Relaxed)
+            || shared.seek_seq.load(Ordering::SeqCst) != current_seq
+        {
             break;
+        }
+        // Tunggu sampai cpal callback selesai menguras buffer lama jika audio_flush masih true
+        if shared.audio_flush.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+            continue;
         }
         if producer.occupied_len() >= a_cap {
             thread::sleep(Duration::from_millis(5));
@@ -1374,19 +1410,36 @@ fn push_resampled_audio_frame(
     out_rate: u32,
     out_channels: u16,
     expected_audio_pts: &mut Option<f64>,
+    audio_skip_until: &mut Option<f64>,
     atb: f64,
 ) {
     // Gunakan pts() atau timestamp() dari frame
     let raw_ts = aframe.pts().or_else(|| aframe.timestamp());
     let frame_pts = raw_ts.map(|ts| ts as f64 * atb);
+    let in_rate = (aframe.rate() as f64).max(1.0);
+    let frame_dur = aframe.samples() as f64 / in_rate;
 
-    // Inisialisasi expected_audio_pts pada frame pertama (atau setelah seek)
+    // 0. FILTER FRAME SEBELUM TARGET SEEK:
+    // Karena avformat_seek_file melompat ke keyframe sebelum target, buang frame audio
+    // yang posisinya masih sebelum titik seek agar suara tidak mendahului/terlambat dari video.
+    if let Some(target_sec) = *audio_skip_until {
+        if let Some(f_pts) = frame_pts {
+            if f_pts + frame_dur <= target_sec {
+                return;
+            }
+            *audio_skip_until = None;
+        } else {
+            *audio_skip_until = None;
+        }
+    }
+
+    // Inisialisasi expected_audio_pts pada frame pertama yang lolos setelah seek
     let exp_pts = match *expected_audio_pts {
         Some(p) => p,
         None => {
             let start_p = frame_pts.unwrap_or_else(|| *shared.clock_base_pts.lock().unwrap());
-            // Sinkronkan clock_base_pts jika frame pertama punya offset
-            if start_p >= 0.0 && (*shared.clock_base_pts.lock().unwrap() - start_p).abs() > 0.05 {
+            // Kuncikan clock_base_pts persis ke PTS frame audio pertama yang benar-benar diputar!
+            if start_p >= 0.0 {
                 *shared.clock_base_pts.lock().unwrap() = start_p;
             }
             *expected_audio_pts = Some(start_p);
@@ -1409,10 +1462,17 @@ fn push_resampled_audio_frame(
             let silence = vec![0.0f32; 2048.min(gap_samples.max(ch))];
             let mut pushed_total = 0;
             let a_cap = (out_rate as usize) * ch * 2;
+            let current_seq = shared.seek_seq.load(Ordering::SeqCst);
 
             while pushed_total < gap_samples {
-                if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
+                if shared.stop.load(Ordering::Relaxed)
+                    || shared.seek_seq.load(Ordering::SeqCst) != current_seq
+                {
                     break;
+                }
+                if shared.audio_flush.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
                 }
                 if producer.occupied_len() >= a_cap {
                     thread::sleep(Duration::from_millis(5));
@@ -1568,7 +1628,8 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
     let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::default(out_channels as i32);
     let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
 
-    let mut expected_audio_pts: Option<f64> = Some(0.0);
+    let mut expected_audio_pts: Option<f64> = None;
+    let mut audio_skip_until: Option<f64> = None;
     let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
     let mut aframe = ffmpeg_next::frame::Audio::empty();
     let mut applied_seek_seq: u64 = 0;
@@ -1587,16 +1648,19 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             packet_iter = None;
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
-            if input_ctx.seek(ts, ..ts).is_ok() {
-                adecoder.flush();
-                resampler = None; // Reset resampler agar sisa sampel sebelum seek terbuang bersih
-                shared.reset_clock(sec);
-                sent_eof = false;
-                shared.audio_eof.store(false, Ordering::Relaxed);
-            }
+            let _ = input_ctx.seek(ts, ..ts);
+            adecoder.flush();
+            resampler = None; // Reset resampler agar sisa sampel sebelum seek terbuang bersih
+            sent_eof = false;
+            shared.audio_eof.store(false, Ordering::Relaxed);
+            // Pastikan cpal callback menguras habis ringbuffer sebelum sampel baru didorong
+            shared.audio_flush.store(true, Ordering::SeqCst);
+            shared.audio_buffered_hint.store(0, Ordering::SeqCst);
             packet_iter = Some(input_ctx.packets());
             applied_seek_seq = current_seq;
-            expected_audio_pts = Some(sec);
+            expected_audio_pts = None;
+            audio_skip_until = Some(sec);
+            shared.audio_acked_seq.store(current_seq, Ordering::SeqCst);
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -1617,10 +1681,13 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                     let _ = adecoder.send_eof();
                     sent_eof = true;
                     while adecoder.receive_frame(&mut aframe).is_ok() {
+                        if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                            break;
+                        }
                         push_resampled_audio_frame(
                             &mut aframe, &mut resampler, &mut producer, &shared,
                             adecoder.channels() as i32, out_layout, out_rate, out_channels,
-                            &mut expected_audio_pts, atb,
+                            &mut expected_audio_pts, &mut audio_skip_until, atb,
                         );
                     }
                     eprintln!(
@@ -1643,10 +1710,13 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             continue;
         }
         while adecoder.receive_frame(&mut aframe).is_ok() {
+            if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                break;
+            }
             push_resampled_audio_frame(
                 &mut aframe, &mut resampler, &mut producer, &shared,
                 adecoder.channels() as i32, out_layout, out_rate, out_channels,
-                &mut expected_audio_pts, atb,
+                &mut expected_audio_pts, &mut audio_skip_until, atb,
             );
         }
     }
