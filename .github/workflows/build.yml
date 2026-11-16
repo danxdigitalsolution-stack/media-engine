@@ -85,7 +85,7 @@ jobs:
           # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
           # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
           # signifikan (biar gampang dibedain di tab cache Actions).
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v24-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v23-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -113,8 +113,7 @@ jobs:
           # Setup build statis dan install ke folder prefix yang sama kayak FFmpeg
           meson setup build --cross-file cross_file.txt --default-library static --prefix="$HOME/ffmpeg-windows" --libdir="lib"
           ninja -C build
-          ninja -C build install         
-      
+          ninja -C build install
 
       # 🎼 [BARU] Kompilasi libmp3lame statis (cross ke Windows). FFmpeg TIDAK
       # punya native MP3 encoder built-in -- satu-satunya cara encode ke MP3
@@ -330,8 +329,7 @@ jobs:
               # Dengan --start-group/--end-group, ld looping ulang di
               # dalam grup ini sampai semua simbol ke-resolve -- jadi juga
               # future-proof kalau nanti nambah lib statis lain lagi
-              # (mis. libopus), gak perlu mikirin urutan manual per lib.              
-              "-C", "link-arg=-lsynchronization",
+              # (mis. libopus), gak perlu mikirin urutan manual per lib.
               "-C", "link-arg=-Wl,--start-group",
               "-C", "link-arg=-ldav1d",
               "-C", "link-arg=-lmp3lame",
@@ -357,7 +355,7 @@ jobs:
       # "unknown type name '_tile1024i'". Dikirim ke step berikutnya lewat
       # GITHUB_ENV -- jadi JANGAN set BINDGEN_EXTRA_CLANG_ARGS_* lagi di
       # `env:` step maturin (bakal menimpa hasil ini).
-      - name: 🩹 Skip header AMX & arahkan include mingw buat bindgen
+      - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
         run: |
           inc=/usr/lib/llvm-18/lib/clang/18/include
           if [ ! -d "$inc" ]; then
@@ -368,28 +366,33 @@ jobs:
             echo "::error::Guard AMX tidak ketemu di $inc"
             exit 1
           fi
-          # Tambahkan target mingw32 & include path supaya libclang bindgen tidak pakai header Linux
-          extra_args="--target=x86_64-w64-mingw32 -I$HOME/ffmpeg-windows/include -I/usr/x86_64-w64-mingw32/include $defs"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$extra_args" >> "$GITHUB_ENV"
-          echo "CFLAGS_x86_64_pc_windows_gnu=-I$HOME/ffmpeg-windows/include" >> "$GITHUB_ENV"
+          echo "Header dir : $inc"
+          echo "Guard AMX  : $defs"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
 
+      # ⚙️ FFmpeg udah dikompilasi manual di step sebelumnya dan diarahkan
+      # lewat FFMPEG_DIR (env, sudah di-export ke $GITHUB_ENV). ffmpeg-sys-next
+      # tinggal linking ke situ, gak nyoba compile ulang dari source lagi.
       - name: ⚙️ Kompilasi Modul Rust (link ke FFmpeg hasil cross-compile)
         timeout-minutes: 30
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-        run: maturin build --release --target x86_64-pc-windows-gnu --out dist
+        run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
-      # 🩺 [BARU] Kalau build.rs crate manapun gagal (exit status 101),
-      # cetak isi stderr dari folder build out supaya pesan panic aslinya langsung kelihatan!
-      - name: 🩺 Dump stderr build script Rust & config.log FFmpeg kalau gagal
+      # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
+      # ada di ffmpeg-src/ffbuild/config.log. Kalau justru step linking modul
+      # Rust yang gagal, cek dulu bagian "--- stderr"/"--- stdout" dari error
+      # cargo/maturin di step sebelumnya (biasanya sudah cukup jelas untuk
+      # kasus linker, bukan lagi soal configure FFmpeg).
+      - name: 🩺 Dump config.log FFmpeg kalau gagal
         if: failure()
         run: |
-          find target -name "stderr" -exec sh -c 'if [ -s "$1" ]; then echo "==== $1 ===="; cat "$1"; fi' _ {} \;
           if [ -f ffmpeg-src/ffbuild/config.log ]; then
             echo "==== ffmpeg-src/ffbuild/config.log (200 baris terakhir) ===="
             tail -n 200 ffmpeg-src/ffbuild/config.log
           fi
+          find target -iname 'config.log' -exec sh -c 'echo "==== {} ===="; tail -n 200 "{}"' \; 2>/dev/null || true
 
       - name: 📋 Hasil
         run: ls -la dist/
