@@ -214,21 +214,18 @@ jobs:
           ]
           EOF
 
-      - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
+      - name: 🩹 Skip header AMX & SIMD intrinsics buat bindgen (Clang 21 mingw)
         run: |
           inc=/usr/lib/llvm-21/lib/clang/21/include
           if [ ! -d "$inc" ]; then
             inc="$(dirname "$(find /usr/lib -path '*/clang/*/include/immintrin.h' | head -n1)")"
           fi
           defs="$(grep -h -m1 '^#ifndef __AMX' "$inc"/amx*.h | awk '{print "-D"$2}' | sort -u | tr '\n' ' ')"
-          if [ -z "$defs" ]; then
-            echo "::error::Guard AMX tidak ketemu di $inc"
-            exit 1
-          fi
-          echo "Header dir : $inc"
-          echo "Guard AMX  : $defs"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=-march=x86-64-v3 $defs" >> "$GITHUB_ENV"          
-
+          simd_guards="-D_MM_MALLOC_H_INCLUDED -D__MM_MALLOC_H -D__X86INTRIN_H -D__IMMINTRIN_H -D__MMINTRIN_H -D__XMMINTRIN_H -D__EMMINTRIN_H -D__PMMINTRIN_H -D__TMMINTRIN_H -D__SMMINTRIN_H -D__NMMINTRIN_H -D__WMMINTRIN_H -D__AVXINTRIN_H -D__AVX2INTRIN_H -D__F16CINTRIN_H -D__FMAINTRIN_H"          
+          echo "Header dir  : $inc"
+          echo "Guard flags : $simd_guards $defs"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$simd_guards $defs" >> "$GITHUB_ENV"
+          
       - name: ⚙️ Kompilasi Modul Rust (link ke FFmpeg hasil cross-compile)
         timeout-minutes: 30
         env:
