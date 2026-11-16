@@ -1021,7 +1021,7 @@ impl PlayerEngine {
                     // sama sekali (jadi gak perlu bikin nilai error tiruan).
                     let build_result: Option<Result<cpal::Stream, cpal::Error>> = match cfg.sample_format() {
                         cpal::SampleFormat::F32 => Some(device.build_output_stream(
-                            stream_cfg,
+                            &stream_cfg,
                             move |data: &mut [f32], _| {
                                 if shared_cb.audio_flush.swap(false, Ordering::SeqCst) {
                                     while consumer.try_pop().is_some() {}
