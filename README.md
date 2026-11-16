@@ -29,7 +29,7 @@ Python remains the primary language across Macan Angkasa. `media_engine` (and it
 - Rust (stable) with the target you're building for
 - Python 3.10+ (host, for running `maturin`)
 - [Maturin](https://www.maturin.rs)
-- FFmpeg 7.1 development libraries — how these are provided depends on platform (see below)
+- FFmpeg 9.0 development libraries — how these are provided depends on platform (see below)
 
 ### Linux (native build/lint)
 
@@ -44,7 +44,7 @@ cargo build --release
 
 Audio output uses `cpal`'s WASAPI backend on Windows, which goes through `windows-sys`/COM and needs no extra C libraries — this is what makes cross-compiling from Linux practical.
 
-FFmpeg itself is **not** compiled through `ffmpeg-sys-next`'s `build` feature on Windows targets. `ffmpeg-sys-next` 7.x passes the wrong `--target_os` string when cross-compiling (`windows` instead of `mingw32`), which breaks FFmpeg's `configure` step. Instead:
+FFmpeg itself is **not** compiled through `ffmpeg-sys-next`'s `build` feature on Windows targets. `ffmpeg-sys-next` 9.x passes the wrong `--target_os` string when cross-compiling (`windows` instead of `mingw32`), which breaks FFmpeg's `configure` step. Instead:
 
 1. FFmpeg is cross-compiled manually with `--target-os=mingw32` (see `build.yml`).
 2. The result is pointed to via the `FFMPEG_DIR` environment variable.
