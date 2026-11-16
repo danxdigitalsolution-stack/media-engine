@@ -72,7 +72,7 @@ rayon = "1.12"
 # pakai feature "build"-nya sendiri buat compile FFmpeg dari source, karena
 # di situ TARGET == HOST jadi gak kena bug cross-compile target_os di bawah.
 [target.'cfg(not(windows))'.dependencies]
-ffmpeg-next = { version = "9.0", default-features = false, features = [
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = [
     "static",
     "build",
     "codec",
@@ -80,6 +80,18 @@ ffmpeg-next = { version = "9.0", default-features = false, features = [
     "software-resampling",
     "software-scaling"
 ] }
+# [FIX] Pin ffmpeg-sys-next ke 9.0.1. ffmpeg-next 9.0.0 hanya minta
+# `ffmpeg-sys-next = "^9.0.0"`, jadi tanpa pin ini cargo tetap milih 9.1.1
+# (rilis baru yang target-nya FFmpeg 9.1: build.rs-nya nambah deteksi
+# `ffmpeg_9_1` (libavcodec 63.22), header wrapper CUDA baru, dst) padahal
+# build.yml mengompilasi FFmpeg n9.0 -> build script crate itu gagal
+# ("failed to run custom build command for ffmpeg-sys-next v9.1.1").
+# Features TIDAK dideklarasi di sini: dia otomatis ikut feature yang diminta
+# ffmpeg-next di tiap tabel target (static / build / codec / dst).
+# Kalau nanti mau naik ke FFmpeg 9.1: naikkan FFMPEG_TAG di build.yml ke n9.1
+# (setelah tag-nya ada), lalu ganti keempat pin ini jadi ffmpeg-next "=9.1.0"
+# dan ffmpeg-sys-next "=9.1.1".
+ffmpeg-sys-next = { version = "=9.0.1", default-features = false }
 
 # Windows (native ATAU cross-compile dari Linux): TIDAK pakai feature "build".
 # ffmpeg-sys-next salah kirim --target_os=windows ke `configure` FFmpeg pas
@@ -89,13 +101,14 @@ ffmpeg-next = { version = "9.0", default-features = false, features = [
 # (lihat build.yml) dengan --target-os=mingw32 yang benar, lalu ffmpeg-sys-next
 # diarahkan ke situ lewat env var FFMPEG_DIR.
 [target.'cfg(windows)'.dependencies]
-ffmpeg-next = { version = "9.0", default-features = false, features = [
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = [
     "static",
     "codec",
     "format",
     "software-resampling",
     "software-scaling"
 ] }
+ffmpeg-sys-next = { version = "=9.0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
