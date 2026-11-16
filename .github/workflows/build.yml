@@ -216,7 +216,7 @@ jobs:
 
       - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
         run: |
-          inc=/usr/lib/llvm-18/lib/clang/18/include
+          inc=/usr/lib/llvm-21/lib/clang/21/include
           if [ ! -d "$inc" ]; then
             inc="$(dirname "$(find /usr/lib -path '*/clang/*/include/immintrin.h' | head -n1)")"
           fi
