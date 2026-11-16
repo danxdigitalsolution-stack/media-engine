@@ -85,7 +85,7 @@ jobs:
           # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
           # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
           # signifikan (biar gampang dibedain di tab cache Actions).
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v23-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v25-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
