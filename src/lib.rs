@@ -510,6 +510,11 @@ struct Shared {
     volume_bits: AtomicU32,
     muted: AtomicBool,
 
+    // [BARU] Kecepatan playback (1.0 = normal), f32 via to_bits(). Dibaca
+    // audio callback (WSOLA time-stretch) dan Shared::position() (jalur
+    // video-only yang pakai wall-clock). Rentang efektif 0.25 .. 4.0.
+    rate_bits: AtomicU32,
+
     // [BARU] Equalizer 10-band (peaking biquad) + preamp. Koefisien dihitung
     // di thread Python (set_equalizer) lalu dititipkan di eq_params; audio
     // callback cpal cuma nyalin pas eq_seq berubah, pakai try_lock() --
@@ -564,11 +569,17 @@ impl Shared {
             let base = *self.clock_base_pts.lock().unwrap();
             match *self.clock_base_wall.lock().unwrap() {
                 Some(t) if self.playing.load(Ordering::Relaxed) => {
-                    base + t.elapsed().as_secs_f64()
+                    base + t.elapsed().as_secs_f64() * self.rate()
                 }
                 _ => base,
             }
         }
+    }
+
+    /// Kecepatan playback sekarang (1.0 = normal).
+    fn rate(&self) -> f64 {
+        let r = f32::from_bits(self.rate_bits.load(Ordering::Relaxed)) as f64;
+        if r.is_finite() && r > 0.0 { r } else { 1.0 }
     }
 
     /// Volume yang beneran dipakai di audio callback: 0 kalau lagi muted,
@@ -599,6 +610,227 @@ impl Shared {
         self.freeze_clock(pts);
         self.audio_flush.store(true, Ordering::Relaxed);
         self.audio_buffered_hint.store(0, Ordering::Relaxed);
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════
+// [BARU] Time-stretch (WSOLA) buat variable playback speed
+// ════════════════════════════════════════════════════════════════════════
+// Audio dipercepat/diperlambat TANPA ngubah pitch (suara gak jadi "chipmunk"
+// di 2.0x atau "monster" di 0.5x). Jalan di audio callback cpal, di SISI
+// KONSUMEN ring buffer: ring buffer tetep nyimpen sample sumber apa adanya
+// (gak tergantung rate), jadi ganti kecepatan itu instan -- gak perlu flush /
+// seek ulang, dan clock master (audio_frames_played) tetep ngitung "frame
+// SUMBER yang udah lewat", bukan frame output. Alhasil video otomatis ikut
+// sync ke kecepatan baru tanpa perubahan apapun di video_decode_loop.
+//
+// Algoritma: WSOLA (waveform-similarity overlap-add). Tiap hop, ambil satu
+// window Hann dari input di sekitar posisi nominal (maju `hs * rate` frame
+// per hop), geser sedikit (+-tol) ke titik yang gelombangnya paling mirip
+// sama "kelanjutan alami" window sebelumnya, lalu overlap-add 50%.
+//
+// SEMUA buffer dialokasi di new() (capacity dihitung di muka) -- gak ada
+// alokasi di jalur real-time selama rate dalam rentang 0.25 .. 4.0.
+struct TimeStretcher {
+    ch: usize,
+    n: usize,                 // panjang window (frame)
+    hs: usize,                // synthesis hop = n/2
+    tol: usize,               // rentang pencarian +-tol frame
+    win: Vec<f32>,            // Hann periodik (overlap 50% -> jumlahnya 1.0)
+    inbuf: Vec<f32>,          // input interleaved (sudah lewat EQ)
+    nom: f64,                 // posisi nominal baca (frame, relatif inbuf)
+    ref_pos: Option<usize>,   // awal "kelanjutan alami" segmen sebelumnya
+    real_end: Option<usize>,  // batas audio ASLI (frame) kalau ekor udah dipad nol (eof)
+    ola: Vec<f32>,            // akumulator overlap-add (n frame)
+    outq: VecDeque<f32>,      // output siap dibunyikan (interleaved)
+    adv_carry: f64,           // sisa pecahan frame buat akumulasi clock
+}
+
+impl TimeStretcher {
+    fn new(sample_rate: u32, channels: usize) -> Self {
+        let ch = channels.max(1);
+        let sr = sample_rate.max(8000) as f64;
+        let n = (((sr * 0.030) as usize) & !1).max(128); // ~30ms, genap
+        let hs = n / 2;
+        let tol = ((sr * 0.010) as usize).max(32);        // ~10ms
+        let win: Vec<f32> = (0..n)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
+            .collect();
+        // Capacity: inbuf paling banyak ~ nom(<= tol + hs*rate_max) + tol + n.
+        // rate max 4.0 -> hs*4 = 2n. Dikali 2 buat aman.
+        let in_cap = (n * 6 + tol * 4 + 4096) * ch;
+        TimeStretcher {
+            ch, n, hs, tol, win,
+            inbuf: Vec::with_capacity(in_cap),
+            nom: 0.0,
+            ref_pos: None,
+            real_end: None,
+            ola: vec![0.0; n * ch],
+            outq: VecDeque::with_capacity((n * 4 + 8192) * ch),
+            adv_carry: 0.0,
+        }
+    }
+
+    /// Buang semua state (dipanggil pas seek/flush).
+    fn clear(&mut self) {
+        self.inbuf.clear();
+        self.nom = 0.0;
+        self.ref_pos = None;
+        self.real_end = None;
+        for v in self.ola.iter_mut() { *v = 0.0; }
+        self.outq.clear();
+        self.adv_carry = 0.0;
+    }
+
+    fn has_state(&self) -> bool {
+        !self.inbuf.is_empty() || !self.outq.is_empty() || self.ref_pos.is_some()
+    }
+
+    /// Jumlah sample (interleaved) yang masih ngendon di sini: input yang
+    /// belum "dikonsumsi" + output yang belum dibunyikan. Dipakai buat
+    /// audio_buffered_hint biar is_eof() gak true sebelum ekor audio abis.
+    fn buffered_samples(&self) -> usize {
+        let have = self.real_end.unwrap_or(self.inbuf.len() / self.ch);
+        let nom_i = (self.nom.max(0.0).round() as usize).min(have);
+        (have - nom_i) * self.ch + self.outq.len()
+    }
+
+    /// Dipanggil pas rate balik ke 1.0: sisa input yang belum dikonsumsi
+    /// dipindah ke `pending` biar jalur normal (tanpa stretch) lanjut dari
+    /// titik yang pas. Output yang udah dihitung (<= ~1 hop, ~15ms) dibuang.
+    fn dump_into(&mut self, pending: &mut VecDeque<f32>) {
+        let have = self.real_end.unwrap_or(self.inbuf.len() / self.ch);
+        let nom_i = (self.nom.max(0.0).round() as usize).min(have);
+        pending.extend(self.inbuf[nom_i * self.ch..].iter().copied());
+        self.clear();
+    }
+
+    #[inline]
+    fn mono_at(buf: &[f32], ch: usize, frame: usize) -> f32 {
+        let b = frame * ch;
+        let mut s = 0.0f32;
+        for c in 0..ch { s += buf[b + c]; }
+        s / ch as f32
+    }
+
+    /// Cari offset start terbaik di [lo, hi] (frame): yang segmen
+    /// `hs` frame-nya paling mirip (normalized cross-correlation) sama
+    /// segmen referensi di `ref_pos`. Sampling jarang (step) biar murah.
+    fn best_start(&self, ref_pos: usize, lo: usize, hi: usize) -> usize {
+        const STEP: usize = 4;   // subsample di dalam segmen
+        const CSTEP: usize = 2;  // subsample kandidat
+        let ch = self.ch;
+        let hs = self.hs;
+        let mut best = lo;
+        let mut best_score = f32::MIN;
+        let mut cand = lo;
+        while cand <= hi {
+            let mut corr = 0.0f32;
+            let mut energy = 1e-9f32;
+            let mut j = 0;
+            while j < hs {
+                let a = Self::mono_at(&self.inbuf, ch, ref_pos + j);
+                let b = Self::mono_at(&self.inbuf, ch, cand + j);
+                corr += a * b;
+                energy += b * b;
+                j += STEP;
+            }
+            let score = corr / energy.sqrt();
+            if score > best_score {
+                best_score = score;
+                best = cand;
+            }
+            cand += CSTEP;
+        }
+        best
+    }
+
+    /// Produksi satu hop output (hs frame) ke `outq`. Return false kalau
+    /// input belum cukup (underrun) -- TANPA ngubah state yang ngegeser
+    /// timeline, jadi aman dicoba lagi di callback berikutnya.
+    ///
+    /// `eof` = decode thread udah selesai total (dibaca SEBELUM nguras ring
+    /// buffer, jadi semua sample terakhir pasti udah ada di ring/inbuf).
+    /// Pas eof, ekor yang kurang dari satu window dipad nol supaya audio
+    /// terakhir tetap kebunyi.
+    fn produce_hop(
+        &mut self,
+        consumer: &mut AudioConsumer,
+        pending: &mut VecDeque<f32>,
+        rate: f64,
+        eof: bool,
+        ingest: &mut dyn FnMut(f32, usize) -> f32,
+    ) -> bool {
+        let ch = self.ch;
+        let nom_i = self.nom.max(0.0).round() as usize;
+        let need_frames = nom_i + self.tol + self.n + 1;
+
+        // Isi inbuf dari `pending` (sisa jalur normal, udah ke-EQ) lalu ring.
+        while self.inbuf.len() < need_frames * ch {
+            if let Some(s) = pending.pop_front() {
+                self.inbuf.push(s);
+            } else if let Some(s) = consumer.try_pop() {
+                let c = self.inbuf.len() % ch;
+                let v = ingest(s, c);
+                self.inbuf.push(v);
+            } else {
+                break;
+            }
+        }
+
+        let have = self.inbuf.len() / ch;
+        if have < need_frames {
+            // Masih ada audio asli yang belum dikonsumsi? Kalau udah eof,
+            // pad nol sampai cukup satu window; kalau enggak, nunggu.
+            let real = self.real_end.unwrap_or(have);
+            if eof && (real as f64) > self.nom + 1.0 {
+                if self.real_end.is_none() {
+                    self.real_end = Some(have); // batas audio asli, sisanya nol
+                }
+                self.inbuf.resize(need_frames * ch, 0.0);
+            } else {
+                return false;
+            }
+        }
+
+        let lo = nom_i.saturating_sub(self.tol);
+        let hi = nom_i + self.tol;
+        let start = match self.ref_pos {
+            None => nom_i,
+            Some(rp) => self.best_start(rp, lo, hi),
+        };
+
+        // Overlap-add window Hann.
+        for i in 0..self.n {
+            let w = self.win[i];
+            let src = (start + i) * ch;
+            let dst = i * ch;
+            for c in 0..ch {
+                self.ola[dst + c] += w * self.inbuf[src + c];
+            }
+        }
+        // Setengah pertama sudah final -> ke outq; geser setengah kedua.
+        let half = self.hs * ch;
+        for k in 0..half {
+            self.outq.push_back(self.ola[k]);
+        }
+        self.ola.copy_within(half..self.n * ch, 0);
+        for v in self.ola[(self.n - self.hs) * ch..].iter_mut() { *v = 0.0; }
+
+        self.ref_pos = Some(start + self.hs);
+        self.nom += self.hs as f64 * rate;
+
+        // Trim bagian input yang udah gak mungkin dipakai lagi.
+        let nom_new = self.nom.max(0.0).round() as usize;
+        let keep = (start + self.hs).min(nom_new.saturating_sub(self.tol));
+        if keep > 0 {
+            self.inbuf.drain(0..keep * ch);
+            self.nom -= keep as f64;
+            if let Some(rp) = self.ref_pos.as_mut() { *rp -= keep; }
+            if let Some(re) = self.real_end.as_mut() { *re = re.saturating_sub(keep); }
+        }
+        true
     }
 }
 
@@ -714,6 +946,7 @@ impl PlayerEngine {
             has_audio: AtomicBool::new(has_audio),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            rate_bits: AtomicU32::new(1.0f32.to_bits()),
             eq_params: Mutex::new(EqState::default()),
             eq_seq: AtomicU64::new(0),
             seek_seq: AtomicU64::new(0),
@@ -770,6 +1003,14 @@ impl PlayerEngine {
                     let mut eq_local = EqState::default();
                     let mut eq_seen: u64 = 0;
 
+                    // [BARU] State time-stretch (variable speed). Dialokasi di
+                    // sini, BUKAN di dalam callback. `pending` nampung sisa
+                    // input pas rate balik ke 1.0 (lihat dump_into).
+                    let mut stretcher = TimeStretcher::new(sample_rate as u32, eq_ch);
+                    let mut pending: VecDeque<f32> = VecDeque::with_capacity(
+                        (stretcher.n + stretcher.tol * 2 + 4096) * eq_ch,
+                    );
+
                     // [UPDATE cpal 0.18] Sejak 0.18 semua enum error per-operasi
                     // (BuildStreamError, StreamError, dkk) udah dilebur jadi satu
                     // `cpal::Error` (gak ada varian publik yang bisa dikonstruksi
@@ -788,6 +1029,8 @@ impl PlayerEngine {
                                     // Timeline loncat (seek): buang history filter biar
                                     // ekor audio lama gak "bocor" ke posisi baru.
                                     for h in eq_hist.iter_mut() { *h = [0.0; 2]; }
+                                    stretcher.clear();
+                                    pending.clear();
                                     for sample in data.iter_mut() {
                                         *sample = 0.0;
                                     }
@@ -810,10 +1053,84 @@ impl PlayerEngine {
                                 let eq_active = eq_local.enabled
                                     && (eq_local.n > 0 || (eq_local.preamp - 1.0).abs() > 1e-6);
 
+                                // [BARU] Variable speed. rate ~1.0 -> jalur normal di
+                                // bawah (persis kayak sebelumnya). Selain itu ->
+                                // WSOLA: pitch tetap, durasi berubah.
+                                let rate = shared_cb.rate();
+                                if (rate - 1.0).abs() > 0.005 {
+                                    let eof = shared_cb.audio_eof.load(Ordering::Relaxed);
+                                    let frames_needed = data.len() / ch;
+                                    {
+                                        // EQ dijalankan di sisi INPUT (sample sumber),
+                                        // jadi history biquad-nya tetap kontinu.
+                                        let mut ingest = |s: f32, c: usize| -> f32 {
+                                            if !eq_active { return s; }
+                                            let c = c % eq_ch;
+                                            let hist = &mut eq_hist[c * EQ_BANDS..(c + 1) * EQ_BANDS];
+                                            let mut x = (s * eq_local.preamp) as f64;
+                                            for b in 0..eq_local.n {
+                                                let k = &eq_local.bands[b];
+                                                let y = k[0] * x + hist[b][0];
+                                                hist[b][0] = k[1] * x - k[3] * y + hist[b][1];
+                                                hist[b][1] = k[2] * x - k[4] * y;
+                                                x = y;
+                                            }
+                                            (x as f32).clamp(-1.0, 1.0)
+                                        };
+                                        while stretcher.outq.len() / ch < frames_needed {
+                                            if !stretcher.produce_hop(&mut consumer, &mut pending, rate, eof, &mut ingest) {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    let mut popped = 0usize;
+                                    for sample in data.iter_mut() {
+                                        if let Some(v) = stretcher.outq.pop_front() {
+                                            *sample = v * vol;
+                                            popped += 1;
+                                        } else {
+                                            *sample = 0.0;
+                                        }
+                                    }
+
+                                    shared_cb.audio_buffered_hint.store(
+                                        consumer.occupied_len() + pending.len() + stretcher.buffered_samples(),
+                                        Ordering::Relaxed,
+                                    );
+
+                                    // Master clock = frame SUMBER yang lewat: tiap frame
+                                    // output mewakili `rate` frame sumber.
+                                    if popped >= ch {
+                                        let adv = (popped / ch) as f64 * rate + stretcher.adv_carry;
+                                        let whole = adv.floor();
+                                        stretcher.adv_carry = adv - whole;
+                                        shared_cb.audio_frames_played.fetch_add(whole as u64, Ordering::Relaxed);
+                                    } else if shared_cb.audio_eof.load(Ordering::Relaxed)
+                                        && shared_cb.playing.load(Ordering::Relaxed)
+                                    {
+                                        let adv = (data.len() / ch) as f64 * rate + stretcher.adv_carry;
+                                        let whole = adv.floor();
+                                        stretcher.adv_carry = adv - whole;
+                                        shared_cb.audio_frames_played.fetch_add(whole as u64, Ordering::Relaxed);
+                                    }
+                                    return;
+                                }
+                                // Balik ke 1.0x: pindahin sisa input stretcher biar gak
+                                // ada audio yang loncat/ilang.
+                                if stretcher.has_state() {
+                                    stretcher.dump_into(&mut pending);
+                                }
+
                                 for (i, sample) in data.iter_mut().enumerate() {
-                                    if let Some(s) = consumer.try_pop() {
+                                    let (src, from_pending) = match pending.pop_front() {
+                                        Some(p) => (Some(p), true),
+                                        None => (consumer.try_pop(), false),
+                                    };
+                                    if let Some(s) = src {
                                         let mut v = s;
-                                        if eq_active {
+                                        // Sample dari `pending` udah ke-EQ di jalur stretch.
+                                        if eq_active && !from_pending {
                                             let c = i % eq_ch;
                                             let hist = &mut eq_hist[c * EQ_BANDS..(c + 1) * EQ_BANDS];
                                             let mut x = (s * eq_local.preamp) as f64;
@@ -835,7 +1152,7 @@ impl PlayerEngine {
                                 }
 
                                 // Update sisa buffer secara real-time agar is_eof() dan wait_for_seek_ready() akurat
-                                shared_cb.audio_buffered_hint.store(consumer.occupied_len(), Ordering::Relaxed);
+                                shared_cb.audio_buffered_hint.store(consumer.occupied_len() + pending.len(), Ordering::Relaxed);
 
                                 // Master clock: Hanya maju sesuai jumlah sample asli yang keluar.
                                 // KECUALI jika audio sudah benar-benar EOF namun video masih punya sisa durasi,
@@ -1080,6 +1397,28 @@ impl PlayerEngine {
     fn clear_equalizer(&mut self) {
         *self.shared.eq_params.lock().unwrap() = EqState::default();
         self.shared.eq_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// [BARU] Atur kecepatan playback: 0.25 .. 4.0 (1.0 = normal). Audio
+    /// pakai time-stretch WSOLA jadi pitch tetap. Aman dipanggil kapan saja
+    /// (playing/paused) -- gak ada flush/seek, gak ada jeda. Video ikut
+    /// otomatis karena master clock-nya sekarang ngitung waktu SUMBER.
+    fn set_playback_rate(&mut self, rate: f64) {
+        let r = if rate.is_finite() { rate.clamp(0.25, 4.0) } else { 1.0 } as f32;
+        if self.shared.has_audio.load(Ordering::Relaxed) {
+            self.shared.rate_bits.store(r.to_bits(), Ordering::Relaxed);
+        } else {
+            // Video-only (atau device audio gagal): clock-nya wall-clock,
+            // jadi re-base di posisi sekarang supaya posisi gak loncat
+            // waktu rate berubah di tengah jalan.
+            let pos = self.shared.position();
+            self.shared.rate_bits.store(r.to_bits(), Ordering::Relaxed);
+            self.shared.freeze_clock(pos);
+        }
+    }
+
+    fn get_playback_rate(&self) -> f64 {
+        self.shared.rate()
     }
 
     fn is_eof(&self) -> bool {
