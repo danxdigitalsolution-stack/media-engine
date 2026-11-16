@@ -227,7 +227,7 @@ jobs:
           fi
           echo "Header dir : $inc"
           echo "Guard AMX  : $defs"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=-march=x86-64-v3 $defs" >> "$GITHUB_ENV"          
 
       - name: ⚙️ Kompilasi Modul Rust (link ke FFmpeg hasil cross-compile)
         timeout-minutes: 30
