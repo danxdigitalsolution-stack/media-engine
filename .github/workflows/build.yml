@@ -113,24 +113,8 @@ jobs:
           # Setup build statis dan install ke folder prefix yang sama kayak FFmpeg
           meson setup build --cross-file cross_file.txt --default-library static --prefix="$HOME/ffmpeg-windows" --libdir="lib"
           ninja -C build
-          ninja -C build install
-          
-      # [FIX] Jangan di-rm! ffmpeg-sys-next 9.0.1 SELALU meng-include
-      # <libavutil/hwcontext_d3d12va.h> kalau libavutil >= 59. Kalau filenya
-      # dihapus, bindgen panic "file not found" (exit status 101).
-      # Solusinya: timpa isinya dengan header stub kosong supaya bindgen
-      # tidak mencari <d3d12video.h> yang tidak ada di mingw-w64 Ubuntu.
-      - name: 🩹 Stub hwcontext_d3d12va.h & Set FFMPEG_DIR
-        run: |
-          echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
-          cat << 'EOF' > "$HOME/ffmpeg-windows/include/libavutil/hwcontext_d3d12va.h"
-          #ifndef AVUTIL_HWCONTEXT_D3D12VA_H
-          #define AVUTIL_HWCONTEXT_D3D12VA_H
-          typedef struct AVD3D12VADeviceContext { int unused; } AVD3D12VADeviceContext;
-          typedef struct AVD3D12VASyncContext { int unused; } AVD3D12VASyncContext;
-          typedef struct AVD3D12VAFramesContext { int unused; } AVD3D12VAFramesContext;
-          #endif
-          EOF
+          ninja -C build install         
+      
 
       # 🎼 [BARU] Kompilasi libmp3lame statis (cross ke Windows). FFmpeg TIDAK
       # punya native MP3 encoder built-in -- satu-satunya cara encode ke MP3
